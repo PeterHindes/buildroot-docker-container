@@ -15,6 +15,9 @@ on:
 env:
   IMAGE_NAME: buildroot-builder
 
+permissions:
+  contents: read
+
 jobs:
   detect-buildroot-version:
     runs-on: ubuntu-latest
@@ -82,8 +85,6 @@ jobs:
     needs: [detect-buildroot-version, smoke-test]
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
-    permissions:
-      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

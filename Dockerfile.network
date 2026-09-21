@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE
+FROM --platform=$BUILDPLATFORM ${BASE_IMAGE} AS network-source-cache
+
+LABEL org.opencontainers.image.description="Buildroot network project cache builder stage"
+
+ENV BR2_EXTERNAL=/tmp/network-project/buildroot-external \
+    BR2_DL_DIR=/opt/buildroot-dl
+
+WORKDIR /opt/buildroot
+
+RUN mkdir -p /opt/buildroot-dl /tmp/network-project/app /tmp/network-build
+
+COPY buildroot-external/ /tmp/network-project/buildroot-external/
+
+RUN --mount=type=cache,target=/root/.cache \
+    make O=/tmp/network-build \
+      BR2_EXTERNAL="${BR2_EXTERNAL}" \
+      BR2_DL_DIR="${BR2_DL_DIR}" \
+      network_riscv32_defconfig \
+    && make O=/tmp/network-build \
+      BR2_EXTERNAL="${BR2_EXTERNAL}" \
+      BR2_DL_DIR="${BR2_DL_DIR}" \
+      source \
+    && test -n "$(find /opt/buildroot-dl -mindepth 1 -type f -print -quit)" \
+    && rm -rf /tmp/network-build /tmp/network-project
+
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.description="Reusable Buildroot builder image with upstream Buildroot sources at /opt/buildroot and pre-downloaded network project sources in /opt/buildroot-dl"
+
+COPY --from=network-source-cache /opt/buildroot-dl /opt/buildroot-dl
+
+ENV BR2_DL_DIR=/opt/buildroot-dl
+
+WORKDIR /project

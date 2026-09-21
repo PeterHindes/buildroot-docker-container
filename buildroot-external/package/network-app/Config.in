@@ -1,0 +1,4 @@
+config BR2_PACKAGE_NETWORK_APP
+	bool "network-app"
+	help
+	  Example external package for network project integration.

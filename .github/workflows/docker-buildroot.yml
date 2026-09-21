@@ -1,12 +1,19 @@
-name: Build and publish Buildroot builder image
+name: Build and publish Buildroot builder images
 
 on:
   push:
     paths:
       - Dockerfile
+      - Dockerfile.network
       - .dockerignore
       - scripts/latest_buildroot_release.sh
+      - scripts/network_dependency_revision.sh
       - .github/workflows/docker-buildroot.yml
+      - buildroot-external/configs/**
+      - buildroot-external/package/**
+      - buildroot-external/Config.in
+      - buildroot-external/external.desc
+      - buildroot-external/external.mk
       - README.md
   workflow_dispatch:
   schedule:
@@ -24,6 +31,7 @@ jobs:
     outputs:
       buildroot_version: ${{ steps.version.outputs.buildroot_version }}
       buildroot_series: ${{ steps.version.outputs.buildroot_series }}
+      network_dep_revision: ${{ steps.network_dep.outputs.network_dep_revision }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,6 +44,13 @@ jobs:
           series="$(cut -d. -f1-2 <<<"${version}")"
           echo "buildroot_version=${version}" >> "$GITHUB_OUTPUT"
           echo "buildroot_series=${series}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine network dependency revision
+        id: network_dep
+        run: |
+          set -euo pipefail
+          revision="$(scripts/network_dependency_revision.sh)"
+          echo "network_dep_revision=${revision}" >> "$GITHUB_OUTPUT"
 
   smoke-test:
     needs: detect-buildroot-version
@@ -54,7 +69,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build smoke-test image
+      - name: Build generic smoke-test image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -64,10 +79,10 @@ jobs:
           tags: local/buildroot-builder:smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           build-args: |
             BUILDROOT_VERSION=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=generic-builder
+          cache-to: type=gha,mode=max,scope=generic-builder
 
-      - name: Run smoke tests
+      - name: Run generic smoke tests
         env:
           TEST_TAG: local/buildroot-builder:smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
         run: |
@@ -80,6 +95,50 @@ jobs:
             python3 --version
             make -C /opt/buildroot help >/dev/null
           '
+
+      - name: Build network cached smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.network
+          load: true
+          platforms: ${{ matrix.platform }}
+          tags: local/buildroot-builder:network-smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          build-args: |
+            BASE_IMAGE=local/buildroot-builder:smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          cache-from: type=gha,scope=network-builder
+          cache-to: type=gha,mode=max,scope=network-builder
+
+      - name: Run network cached image validation
+        env:
+          TEST_TAG: local/buildroot-builder:network-smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/project" \
+            "$TEST_TAG" sh -c '
+              set -euo pipefail
+              test -f /opt/buildroot/Makefile
+              test -d /opt/buildroot-dl
+              test -n "$(find /opt/buildroot-dl -mindepth 1 -type f -print -quit)"
+              du -sh /opt/buildroot-dl
+
+              make -C /opt/buildroot \
+                O=/tmp/network-build \
+                BR2_DL_DIR=/opt/buildroot-dl \
+                BR2_EXTERNAL=/project/buildroot-external \
+                network_riscv32_defconfig
+
+              make -C /opt/buildroot \
+                O=/tmp/network-build \
+                BR2_DL_DIR=/opt/buildroot-dl \
+                BR2_EXTERNAL=/project/buildroot-external \
+                source
+
+              test ! -d /opt/buildroot/output/host
+              test ! -d /opt/buildroot/output/target
+              test ! -x /tmp/network-build/host/bin/riscv32-buildroot-linux-gnu-gcc
+            '
 
   publish:
     needs: [detect-buildroot-version, smoke-test]
@@ -101,8 +160,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Generate Docker metadata
-        id: meta
+      - name: Generate generic Docker metadata
+        id: meta_generic
         uses: docker/metadata-action@v5
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
@@ -118,7 +177,7 @@ jobs:
             org.opencontainers.image.version=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
             io.buildroot.version=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
 
-      - name: Build and push multi-platform image
+      - name: Build and push generic multi-platform image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -127,7 +186,39 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             BUILDROOT_VERSION=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta_generic.outputs.tags }}
+          labels: ${{ steps.meta_generic.outputs.labels }}
+          cache-from: type=gha,scope=generic-builder
+          cache-to: type=gha,mode=max,scope=generic-builder
+
+      - name: Generate network cached Docker metadata
+        id: meta_network
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=network-latest
+            type=raw,value=${{ needs.detect-buildroot-version.outputs.buildroot_version }}-network
+            type=raw,value=${{ needs.detect-buildroot-version.outputs.buildroot_version }}-network-${{ needs.detect-buildroot-version.outputs.network_dep_revision }}
+          labels: |
+            org.opencontainers.image.title=Buildroot builder (network cache)
+            org.opencontainers.image.description=Reusable Buildroot builder image with upstream Buildroot in /opt/buildroot and pre-downloaded network project sources in /opt/buildroot-dl
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.detect-buildroot-version.outputs.buildroot_version }}-network-${{ needs.detect-buildroot-version.outputs.network_dep_revision }}
+            io.buildroot.version=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+            io.buildroot.network_dep_revision=${{ needs.detect-buildroot-version.outputs.network_dep_revision }}
+
+      - name: Build and push network cached multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.network
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BASE_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+          tags: ${{ steps.meta_network.outputs.tags }}
+          labels: ${{ steps.meta_network.outputs.labels }}
+          cache-from: type=gha,scope=network-builder
+          cache-to: type=gha,mode=max,scope=network-builder

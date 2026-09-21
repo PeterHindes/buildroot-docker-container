@@ -1,29 +1,70 @@
 # buildroot-docker-container
 
-This repository publishes a reusable Docker image for Buildroot-based projects.
+This repository publishes reusable Docker images for Buildroot-based projects.
 
-## What the image contains
+## Image variants
 
-The `buildroot-builder` image is built from `ubuntu:24.04` and includes:
+### Generic builder
 
-- Buildroot host build dependencies needed for general Buildroot development.
-- An upstream Buildroot release unpacked at `/opt/buildroot`.
+`buildroot-builder:<version>`
 
-The image intentionally does **not** include your application code or `BR2_EXTERNAL` tree.
+Contains:
 
-## Why Buildroot runs in Docker on macOS
+- Ubuntu 24.04
+- Buildroot host build dependencies
+- Upstream Buildroot unpacked at `/opt/buildroot`
 
-On macOS, bind-mounted filesystems (VirtioFS/APFS) can cause incompatibilities during Linux source extraction/build steps. This image keeps Buildroot sources and Buildroot-generated artifacts on Linux Docker filesystems to avoid those host filesystem issues.
+This image intentionally does **not** include project-specific `BR2_EXTERNAL` configuration or pre-downloaded project source archives.
 
-## Filesystem layout
+### Network-project cached builder
+
+`buildroot-builder:<version>-network`
+
+Contains:
+
+- everything in the generic builder image
+- pre-downloaded source archives for `network_riscv32_defconfig` at `/opt/buildroot-dl`
+
+This cached image still does **not** include a compiled RISC-V toolchain, Linux kernel, root filesystem, BusyBox, OpenSBI, or the project application binaries.
+
+Its purpose is to skip first-build download latency so fresh builds can begin extraction/compilation immediately.
+
+## Tag architecture
+
+Generic tags (existing meaning preserved):
+
+- `buildroot-builder:latest`
+- `buildroot-builder:<BUILDROOT_VERSION>`
+- `buildroot-builder:<BUILDROOT_SERIES>`
+
+Network cached tags:
+
+- `buildroot-builder:network-latest` (moving tag)
+- `buildroot-builder:<BUILDROOT_VERSION>-network` (moving tag for that Buildroot release)
+- `buildroot-builder:<BUILDROOT_VERSION>-network-<NETWORK_DEP_REVISION>` (immutable dependency snapshot tag)
+
+`NETWORK_DEP_REVISION` is a deterministic hash derived from:
+
+- `buildroot-external/configs/**`
+- `buildroot-external/package/**`
+- `buildroot-external/Config.in`
+- `buildroot-external/external.desc`
+- `buildroot-external/external.mk`
+- `Dockerfile` / `Dockerfile.network`
+
+## Runtime filesystem layout
 
 At runtime, use these mounts:
 
-- `/project`: bind-mount your project source from macOS/Linux host.
-- `/opt/buildroot`: Buildroot source tree baked into the image.
+- `/project`: bind-mount your project source from host.
+- `/opt/buildroot`: Buildroot source tree baked into image.
 - `/build`: Docker named volume for Buildroot output (`O=/build`).
 
-Expected shape:
+The network cached image additionally contains:
+
+- `/opt/buildroot-dl`: pre-populated Buildroot download cache.
+
+Expected project shape:
 
 ```text
 host project
@@ -35,13 +76,8 @@ container
 │   ├── app/
 │   └── buildroot-external/
 ├── /opt/buildroot
+├── /opt/buildroot-dl
 └── /build
-    ├── .config
-    ├── build/
-    ├── host/
-    ├── staging/
-    ├── target/
-    └── images/
 ```
 
 ## Persistent build volume
@@ -52,55 +88,80 @@ Create the persistent Buildroot output volume once:
 docker volume create network-project-build
 ```
 
-## Load external defconfig
+## Build commands (network cached image)
+
+Load project defconfig:
 
 ```bash
 docker run --rm -it \
     -v "$PWD:/project" \
     -v network-project-build:/build \
-    <image> \
+    <image-with-network-cache> \
     make -C /opt/buildroot \
         O=/build \
+        BR2_DL_DIR=/opt/buildroot-dl \
         BR2_EXTERNAL=/project/buildroot-external \
         network_riscv32_defconfig
 ```
 
-## Build after configuration
+Build:
 
 ```bash
 docker run --rm -it \
     -v "$PWD:/project" \
     -v network-project-build:/build \
-    <image> \
-    make -C /opt/buildroot O=/build
+    <image-with-network-cache> \
+    make -C /opt/buildroot \
+        O=/build \
+        BR2_DL_DIR=/opt/buildroot-dl
 ```
 
-`buildroot-external/configs/` stores your project configuration sources. `/build/.config` is generated Buildroot working state persisted in the Docker volume.
+If project dependencies change and `/opt/buildroot-dl` is missing some archives, Buildroot can still download the missing files into the container's writable layer (or an alternate writable `BR2_DL_DIR` you provide).
 
 ## GitHub Actions workflow
 
 Workflow: `.github/workflows/docker-buildroot.yml`
 
-It runs on:
+Triggers include:
 
-- changes to Docker/workflow/release-detection files,
-- manual dispatch,
-- a weekly schedule.
+- Docker/build workflow changes
+- project dependency-definition changes (`buildroot-external/configs/**`, `buildroot-external/package/**`, `buildroot-external/Config.in`, `buildroot-external/external.desc`, `buildroot-external/external.mk`)
+- manual dispatch
+- weekly schedule (to refresh base image/dependency updates)
+
+Notably, ordinary app implementation changes (for example `app/src/*.c`) do not by themselves trigger the cached-image workflow.
 
 The workflow:
 
-1. Detects the latest stable Buildroot release from `https://buildroot.org/downloads/` (excluding `-rc*` releases).
-2. Builds smoke-test images for `linux/amd64` and `linux/arm64`.
-3. Verifies at minimum:
-   - `/opt/buildroot/Makefile` exists,
-   - `make`, `gcc`, and `python3` are available,
-   - `make -C /opt/buildroot help` succeeds.
-4. Publishes a multi-platform image to Docker Hub with tags:
-   - `latest`
-   - `<BUILDROOT_VERSION>` (for example `2026.02.1`)
-   - `<BUILDROOT_SERIES>` (for example `2026.02`)
+1. Detects latest stable Buildroot release.
+2. Computes deterministic `NETWORK_DEP_REVISION` hash for dependency metadata.
+3. Builds smoke-test images for `linux/amd64` and `linux/arm64`.
+4. Validates network cache image by checking:
+   - `/opt/buildroot` exists,
+   - `/opt/buildroot-dl` exists and has downloaded archives,
+   - `network_riscv32_defconfig` loads,
+   - `make source` succeeds,
+   - no completed target build outputs are baked into the image.
+5. Publishes multi-platform generic and network-cached manifests.
 
-The scheduled rebuild also refreshes images when Ubuntu base image or apt package updates occur, even if the Buildroot version is unchanged.
+## Multi-platform and cache efficiency
+
+Both variants publish `linux/amd64` and `linux/arm64` manifests.
+
+`Dockerfile.network` computes the `/opt/buildroot-dl` cache in a BuildKit stage pinned to `$BUILDPLATFORM`, then copies that cache into each target-platform image. This avoids re-downloading architecture-independent Buildroot source archives separately for each target architecture during a single multi-platform build.
+
+## Tradeoffs of embedding `/opt/buildroot-dl`
+
+Benefits:
+
+- Faster cold-start project builds.
+- Predictable dependency availability for the validated defconfig.
+
+Tradeoffs:
+
+- Larger image size.
+- Cached archives can lag if dependency metadata changes and image is not rebuilt.
+- `<BUILDROOT_VERSION>-network` is intentionally a moving cache tag; use `<BUILDROOT_VERSION>-network-<NETWORK_DEP_REVISION>` when strict immutability is required.
 
 ## Required GitHub secrets
 
@@ -109,4 +170,4 @@ Set these repository secrets before publishing:
 - `DOCKERHUB_USERNAME`
 - `DOCKERHUB_TOKEN`
 
-The workflow reads these secrets at runtime for Docker Hub authentication. Credentials are not stored in the Dockerfile/image.
+Credentials are only used by the workflow for Docker Hub authentication.

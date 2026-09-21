@@ -1,0 +1,132 @@
+name: Build and publish Buildroot builder image
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - scripts/latest_buildroot_release.sh
+      - .github/workflows/docker-buildroot.yml
+      - README.md
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+env:
+  IMAGE_NAME: buildroot-builder
+
+jobs:
+  detect-buildroot-version:
+    runs-on: ubuntu-latest
+    outputs:
+      buildroot_version: ${{ steps.version.outputs.buildroot_version }}
+      buildroot_series: ${{ steps.version.outputs.buildroot_series }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine latest stable Buildroot release
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(scripts/latest_buildroot_release.sh)"
+          series="$(cut -d. -f1-2 <<<"${version}")"
+          echo "buildroot_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "buildroot_series=${series}" >> "$GITHUB_OUTPUT"
+
+  smoke-test:
+    needs: detect-buildroot-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          platforms: ${{ matrix.platform }}
+          tags: local/buildroot-builder:smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          build-args: |
+            BUILDROOT_VERSION=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run smoke tests
+        env:
+          TEST_TAG: local/buildroot-builder:smoke-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} "$TEST_TAG" sh -c '
+            set -euo pipefail
+            test -f /opt/buildroot/Makefile
+            make --version
+            gcc --version
+            python3 --version
+            make -C /opt/buildroot help >/dev/null
+          '
+
+  publish:
+    needs: [detect-buildroot-version, smoke-test]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+            type=raw,value=${{ needs.detect-buildroot-version.outputs.buildroot_series }}
+          labels: |
+            org.opencontainers.image.title=Buildroot builder
+            org.opencontainers.image.description=Reusable Buildroot builder image with upstream Buildroot in /opt/buildroot
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+            io.buildroot.version=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUILDROOT_VERSION=${{ needs.detect-buildroot-version.outputs.buildroot_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
